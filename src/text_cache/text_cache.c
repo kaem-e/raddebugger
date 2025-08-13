@@ -47,6 +47,10 @@ txt_lang_kind_from_extension(String8 extension)
   {
     kind = TXT_LangKind_Zig;
   }
+  else if(str8_match(extension, str8_lit("rs"), StringMatchFlag_CaseInsensitive))
+  {
+    kind = TXT_LangKind_Rust;
+  }
   return kind;
 }
 
@@ -65,6 +69,7 @@ txt_extension_from_lang_kind(TXT_LangKind kind)
     case TXT_LangKind_Odin:            {result = str8_lit("odin");}break;
     case TXT_LangKind_Jai:             {result = str8_lit("jai");}break;
     case TXT_LangKind_Zig:             {result = str8_lit("zig");}break;
+    case TXT_LangKind_Rust:             {result = str8_lit("rust");}break;
   }
   return result;
 }
@@ -93,6 +98,7 @@ txt_lex_function_from_lang_kind(TXT_LangKind kind)
     case TXT_LangKind_Odin:          {fn = txt_token_array_from_string__odin;}break;
     case TXT_LangKind_Jai:           {fn = txt_token_array_from_string__jai;}break;
     case TXT_LangKind_Zig:           {fn = txt_token_array_from_string__zig;}break;
+    case TXT_LangKind_Rust:           {fn = txt_token_array_from_string__rust;}break;
     case TXT_LangKind_DisasmX64Intel:{fn = txt_token_array_from_string__disasm_x64_intel;}break;
   }
   return fn;
@@ -1076,6 +1082,372 @@ txt_token_array_from_string__jai(Arena *arena, U64 *bytes_processed_counter, Str
   scratch_end(scratch);
   return result;
 }
+
+
+internal TXT_TokenArray
+txt_token_array_from_string__rust(Arena *arena, U64 *bytes_processed_counter, String8 string)
+{
+  Temp scratch = scratch_begin(&arena, 1);
+  
+  //- generate token list
+  TXT_TokenChunkList tokens = {0};
+  {
+    B32 comment_is_single_line = 0;
+    B32 string_is_char = 0;
+    B32 string_is_raw = 0;
+    U32 raw_hash_count = 0;
+    B32 lifetime_mode = 0;
+    TXT_TokenKind active_token_kind = TXT_TokenKind_Null;
+    U64 active_token_start_idx = 0;
+    U64 byte_process_start_idx = 0;
+    B32 escaped = 0;
+    B32 next_escaped = 0;
+    U32 attr_depth = 0;
+    
+    for(U64 idx = 0; idx <= string.size;)
+    {
+      U8 byte      = (idx+0 < string.size) ? (string.str[idx+0]) : 0;
+      U8 next_byte = (idx+1 < string.size) ? (string.str[idx+1]) : 0;
+      
+      // update counter
+      if(bytes_processed_counter != 0 && ((idx-byte_process_start_idx) >= 1000 || idx == string.size))
+      {
+        ins_atomic_u64_add_eval(bytes_processed_counter, (idx-byte_process_start_idx));
+        byte_process_start_idx = idx;
+      }
+      
+      // escaping (only relevant for non-raw strings / comments)
+      if(escaped && (byte != '\r' && byte != '\n'))
+      {
+        next_escaped = 0;
+      }
+      else if(!escaped && byte == '\\')
+      {
+        next_escaped = 1;
+      }
+      
+      // determine active token kind
+      if(active_token_kind == TXT_TokenKind_Null)
+      {
+        if(0){}
+        else if(char_is_space(byte))                           { active_token_kind = TXT_TokenKind_Whitespace; }
+        else if(byte == '\'' && char_is_alpha(next_byte))      { active_token_kind = TXT_TokenKind_Identifier; lifetime_mode = 1; }
+        else if(byte == '_' || char_is_alpha(byte))            { active_token_kind = TXT_TokenKind_Identifier; lifetime_mode = 0; }
+        else if(char_is_digit(byte, 10) ||
+                (byte == '.' && char_is_digit(next_byte, 10))) { active_token_kind = TXT_TokenKind_Numeric; }
+        else if(byte == '"')                                   { active_token_kind = TXT_TokenKind_String; string_is_char = 0; string_is_raw = 0; }
+        else if(byte == '\'')                                  { active_token_kind = TXT_TokenKind_String; string_is_char = 1; string_is_raw = 0; }
+        else if(byte == 'r' && (next_byte == '"' || next_byte == '#'))
+        {
+          active_token_kind = TXT_TokenKind_String;
+          string_is_char = 0;
+          string_is_raw = 1;
+          raw_hash_count = 0;
+          U64 j = idx+1;
+          while(j < string.size && string.str[j] == '#') { raw_hash_count += 1; j += 1; }
+          // if it's not followed by a '"', we'll still treat it as a string and let ender logic fail-safe at end-of-input
+        }
+        else if(byte == '#' && next_byte == '[')               { active_token_kind = TXT_TokenKind_Meta; attr_depth = 1; }
+        else if(byte == '/' && next_byte == '/')               { active_token_kind = TXT_TokenKind_Comment; comment_is_single_line = 1; }
+        else if(byte == '/' && next_byte == '*')               { active_token_kind = TXT_TokenKind_Comment; comment_is_single_line = 0; }
+        else if(byte == '~' || byte == '!' ||
+                byte == '%' || byte == '^' ||
+                byte == '&' || byte == '*' ||
+                byte == '(' || byte == ')' ||
+                byte == '-' || byte == '=' ||
+                byte == '+' || byte == '[' ||
+                byte == ']' || byte == '{' ||
+                byte == '}' || byte == ':' ||
+                byte == ';' || byte == ',' ||
+                byte == '.' || byte == '<' ||
+                byte == '>' || byte == '/' ||
+                byte == '?' || byte == '|' ||
+                byte == '@')
+        {
+          active_token_kind = TXT_TokenKind_Symbol;
+        }
+        
+        // start new token
+        if(active_token_kind != TXT_TokenKind_Null)
+        {
+          active_token_start_idx = idx;
+        }
+        // invalid byte -> emit error token
+        else
+        {
+          TXT_Token token = {TXT_TokenKind_Error, r1u64(idx, idx+1)};
+          txt_token_chunk_list_push(scratch.arena, &tokens, 4096, &token);
+        }
+      }
+      
+      // look for ender
+      U64 ender_pad = 0;
+      B32 ender_found = 0;
+      if(active_token_kind != TXT_TokenKind_Null && idx>active_token_start_idx)
+      {
+        if(idx == string.size)
+        {
+          ender_found = 1;
+          ender_pad = 0;
+        }
+        else switch(active_token_kind)
+        {
+          default: break;
+          case TXT_TokenKind_Whitespace:
+          {
+            ender_found = !char_is_space(byte);
+          }break;
+          case TXT_TokenKind_Identifier:
+          {
+            if(lifetime_mode)
+            {
+              U64 rel = idx - active_token_start_idx;
+              if(rel == 1)
+              {
+                ender_found = !(char_is_alpha(byte) || byte == '_');
+              }
+              else
+              {
+                ender_found = !(char_is_alpha(byte) || char_is_digit(byte, 10) || byte == '_');
+              }
+            }
+            else
+            {
+              ender_found = (!char_is_alpha(byte) && !char_is_digit(byte, 10) && byte != '_' && byte < 128);
+            }
+          }break;
+          case TXT_TokenKind_Numeric:
+          {
+            ender_found = (!char_is_alpha(byte) && !char_is_digit(byte, 10) && byte != '_' && byte != '.');
+          }break;
+          case TXT_TokenKind_String:
+          {
+            if(string_is_raw)
+            {
+              if(byte == '"')
+              {
+                U32 count = 0;
+                U64 j = idx+1;
+                while(j < string.size && string.str[j] == '#' && count < raw_hash_count) { count += 1; j += 1; }
+                if(count == raw_hash_count)
+                {
+                  ender_found = 1;
+                  ender_pad = (j - idx);
+                }
+              }
+            }
+            else if(string_is_char)
+            {
+              ender_found = (!escaped && byte == '\'');
+              if(ender_found) ender_pad += 1;
+            }
+            else
+            {
+              ender_found = (!escaped && byte == '"');
+              if(ender_found) ender_pad += 1;
+            }
+          }break;
+          case TXT_TokenKind_Symbol:
+          {
+            ender_found = (byte != '~' && byte != '!' &&
+                           byte != '%' && byte != '^' &&
+                           byte != '&' && byte != '*' &&
+                           byte != '(' && byte != ')' &&
+                           byte != '-' && byte != '=' &&
+                           byte != '+' && byte != '[' &&
+                           byte != ']' && byte != '{' &&
+                           byte != '}' && byte != ':' &&
+                           byte != ';' && byte != ',' &&
+                           byte != '.' && byte != '<' &&
+                           byte != '>' && byte != '/' &&
+                           byte != '?' && byte != '|' &&
+                           byte != '@');
+          }break;
+          case TXT_TokenKind_Comment:
+          {
+            if(comment_is_single_line)
+            {
+              ender_found = (!escaped && (byte == '\r' || byte == '\n'));
+            }
+            else
+            {
+              ender_found = (active_token_start_idx+1 < idx && byte == '*' && next_byte == '/');
+              if(ender_found) ender_pad += 2;
+            }
+          }break;
+          case TXT_TokenKind_Meta:
+          {
+            if(byte == ']')
+            {
+              if(attr_depth == 0) { ender_found = 1; ender_pad = 1; }
+              else { attr_depth -= 1; }
+            }
+            else if(byte == '[')
+            {
+              attr_depth += 1;
+            }
+          }break;
+        }
+      }
+      
+      // emit token on ender
+      if(ender_found)
+      {
+        TXT_Token token = {active_token_kind, r1u64(active_token_start_idx, idx+ender_pad)};
+        active_token_kind = TXT_TokenKind_Null;
+        
+        // identifier -> keyword in special cases
+        if(token.kind == TXT_TokenKind_Identifier)
+        {
+          read_only local_persist String8 rust_keywords[] =
+          {
+            str8_lit_comp("as"),
+            str8_lit_comp("break"),
+            str8_lit_comp("const"),
+            str8_lit_comp("continue"),
+            str8_lit_comp("crate"),
+            str8_lit_comp("else"),
+            str8_lit_comp("enum"),
+            str8_lit_comp("extern"),
+            str8_lit_comp("false"),
+            str8_lit_comp("fn"),
+            str8_lit_comp("for"),
+            str8_lit_comp("if"),
+            str8_lit_comp("impl"),
+            str8_lit_comp("in"),
+            str8_lit_comp("let"),
+            str8_lit_comp("loop"),
+            str8_lit_comp("match"),
+            str8_lit_comp("mod"),
+            str8_lit_comp("move"),
+            str8_lit_comp("mut"),
+            str8_lit_comp("pub"),
+            str8_lit_comp("ref"),
+            str8_lit_comp("return"),
+            str8_lit_comp("self"),
+            str8_lit_comp("Self"),
+            str8_lit_comp("static"),
+            str8_lit_comp("struct"),
+            str8_lit_comp("super"),
+            str8_lit_comp("trait"),
+            str8_lit_comp("true"),
+            str8_lit_comp("type"),
+            str8_lit_comp("unsafe"),
+            str8_lit_comp("use"),
+            str8_lit_comp("where"),
+            str8_lit_comp("while"),
+            // 2018/2021 additions commonly used
+            str8_lit_comp("async"),
+            str8_lit_comp("await"),
+            str8_lit_comp("dyn"),
+            str8_lit_comp("try"),
+            str8_lit_comp("yield"),
+          };
+          
+          String8 token_string = str8_substr(string, token.range);
+          // skip leading apostrophe for lifetimes so we don't ever promote them
+          if(lifetime_mode && token_string.size > 0 && token_string.str[0] == '\'')
+          {
+            token_string = str8_substr(token_string, r1u64(1, token_string.size));
+          }
+          
+          for(U64 keyword_idx = 0; keyword_idx < ArrayCount(rust_keywords); keyword_idx += 1)
+          {
+            if(str8_match(rust_keywords[keyword_idx], token_string, 0))
+            {
+              token.kind = TXT_TokenKind_Keyword;
+              break;
+            }
+          }
+          txt_token_chunk_list_push(scratch.arena, &tokens, 4096, &token);
+        }
+        
+        // split symbols by maximum-munch rule
+        else if(token.kind == TXT_TokenKind_Symbol)
+        {
+          read_only local_persist String8 rust_multichar_symbol_strings[] =
+          {
+            str8_lit_comp("<<="),
+            str8_lit_comp(">>="),
+            str8_lit_comp("<<"),
+            str8_lit_comp(">>"),
+            str8_lit_comp("..="),
+            str8_lit_comp(".."),
+            str8_lit_comp("=>"),
+            str8_lit_comp("->"),
+            str8_lit_comp("::"),
+            str8_lit_comp("=="),
+            str8_lit_comp("!="),
+            str8_lit_comp("<="),
+            str8_lit_comp(">="),
+            str8_lit_comp("&&"),
+            str8_lit_comp("||"),
+            str8_lit_comp("+="),
+            str8_lit_comp("-="),
+            str8_lit_comp("*="),
+            str8_lit_comp("/="),
+            str8_lit_comp("%="),
+            str8_lit_comp("&="),
+            str8_lit_comp("|="),
+            str8_lit_comp("^="),
+          };
+          
+          String8 token_string = str8_substr(string, token.range);
+          for(U64 off = 0, next_off = token_string.size; off < token_string.size; off = next_off)
+          {
+            B32 found = 0;
+            for(U64 sidx = 0; sidx < ArrayCount(rust_multichar_symbol_strings); sidx += 1)
+            {
+              String8 sym = rust_multichar_symbol_strings[sidx];
+              if(off + sym.size <= token_string.size &&
+                 str8_match(str8_substr(token_string, r1u64(off, off+sym.size)), sym, 0))
+              {
+                found = 1;
+                next_off = off + sym.size;
+                TXT_Token out = {TXT_TokenKind_Symbol, r1u64(active_token_start_idx+off, active_token_start_idx+next_off)};
+                txt_token_chunk_list_push(scratch.arena, &tokens, 4096, &out);
+                break;
+              }
+            }
+            if(!found)
+            {
+              next_off = off+1;
+              TXT_Token out = {TXT_TokenKind_Symbol, r1u64(active_token_start_idx+off, active_token_start_idx+next_off)};
+              txt_token_chunk_list_push(scratch.arena, &tokens, 4096, &out);
+            }
+          }
+        }
+        
+        // all other tokens
+        else
+        {
+          txt_token_chunk_list_push(scratch.arena, &tokens, 4096, &token);
+        }
+        
+        // reset per-token flags
+        lifetime_mode = 0;
+        string_is_raw = 0;
+        string_is_char = 0;
+        
+        // increment by ender padding
+        idx += ender_pad;
+      }
+      
+      // advance by 1 byte if we haven't found an ender
+      if(!ender_found)
+      {
+        idx += 1;
+      }
+      escaped = next_escaped;
+    }
+  }
+  
+  //- token list -> token array
+  TXT_TokenArray result = txt_token_array_from_chunk_list(arena, &tokens);
+  scratch_end(scratch);
+  return result;
+}
+
 
 internal TXT_TokenArray
 txt_token_array_from_string__zig(Arena *arena, U64 *bytes_processed_counter, String8 string)
