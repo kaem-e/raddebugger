@@ -2,6 +2,8 @@
 setlocal enabledelayedexpansion
 cd /D "%~dp0"
 
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Auxiliary\Build\vcvarsall.bat" amd64
+
 :: --- Usage Notes (2024/1/10) ------------------------------------------------
 ::
 :: This is a central build script for the RAD Debugger project, for use in
